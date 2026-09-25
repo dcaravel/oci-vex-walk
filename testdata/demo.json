@@ -1,0 +1,133 @@
+{
+  "cve": "CVE-2099-0001",
+  "labels": {
+    "name": "example/widget",
+    "architecture": "x86_64",
+    "cpe": "cpe:/a:redhat:widget:4.13::el8",
+    "org.opencontainers.image.created": "2025-04-14T02:14:26Z"
+  },
+  "document": {
+    "document": {
+      "category": "csaf_vex",
+      "csaf_version": "2.0",
+      "title": "Synthetic demo \u2014 not a real advisory",
+      "tracking": {
+        "id": "CVE-2099-0001",
+        "status": "final",
+        "version": "1",
+        "initial_release_date": "2025-04-15T00:00:00Z",
+        "current_release_date": "2025-04-15T00:00:00Z"
+      }
+    },
+    "product_tree": {
+      "branches": [
+        {
+          "category": "product_name",
+          "name": "oci-repository",
+          "product": {
+            "product_id": "oci-repository",
+            "name": "oci-repository",
+            "product_identification_helper": {
+              "purl": "pkg:oci/widget?repository_url=registry.redhat.io/example/widget&arch=amd64"
+            }
+          }
+        },
+        {
+          "category": "product_name",
+          "name": "oci-namespace",
+          "product": {
+            "product_id": "oci-namespace",
+            "name": "oci-namespace",
+            "product_identification_helper": {
+              "purl": "pkg:oci/example/widget@sha256:demo?tag=1745000000&arch=amd64"
+            }
+          }
+        },
+        {
+          "category": "product_name",
+          "name": "oci-bare",
+          "product": {
+            "product_id": "oci-bare",
+            "name": "oci-bare",
+            "product_identification_helper": {
+              "purl": "pkg:oci/other"
+            }
+          }
+        },
+        {
+          "category": "product_name",
+          "name": "product-prefix",
+          "product": {
+            "product_id": "product-prefix",
+            "name": "product-prefix",
+            "product_identification_helper": {
+              "cpe": "cpe:/a:redhat:widget:4"
+            }
+          }
+        },
+        {
+          "category": "product_name",
+          "name": "product-exact",
+          "product": {
+            "product_id": "product-exact",
+            "name": "product-exact",
+            "product_identification_helper": {
+              "cpe": "cpe:/a:redhat:widget:4.13::el8"
+            }
+          }
+        }
+      ],
+      "relationships": [
+        {
+          "category": "default_component_of",
+          "full_product_name": {
+            "product_id": "not-affected-status",
+            "name": "not-affected-status"
+          },
+          "product_reference": "oci-repository",
+          "relates_to_product_reference": "product-prefix"
+        },
+        {
+          "category": "default_component_of",
+          "full_product_name": {
+            "product_id": "fixed-status",
+            "name": "fixed-status"
+          },
+          "product_reference": "oci-namespace",
+          "relates_to_product_reference": "product-exact"
+        }
+      ]
+    },
+    "vulnerabilities": [
+      {
+        "cve": "CVE-2099-0001",
+        "notes": [
+          {
+            "category": "description",
+            "text": "Synthetic illustration of repository_url fallback, CPE prefix matching and simultaneous affected / not-affected assertions. Do not use as security data."
+          }
+        ],
+        "product_status": {
+          "known_not_affected": [
+            "not-affected-status"
+          ],
+          "fixed": [
+            "fixed-status"
+          ]
+        },
+        "scores": [
+          {
+            "products": [
+              "fixed-status"
+            ],
+            "cvss_v3": {
+              "version": "3.1",
+              "baseScore": 7.5,
+              "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
