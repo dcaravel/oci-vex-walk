@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/dcaravel/oci-vex-walk/internal/finder"
@@ -11,9 +13,6 @@ import (
 func printReports(out io.Writer, docs []documentReport, o options, imageName, imageCPE string) {
 	o.progressStep(5, "Matching component names")
 	section(out, 5, "Match OCI component names")
-	if imageName != "" {
-		fmt.Fprintf(out, "  Image name: %q (from selected labels.json)\n", imageName)
-	}
 	for _, doc := range docs {
 		r := doc.report
 		matched := 0
@@ -32,6 +31,8 @@ func printReports(out io.Writer, docs []documentReport, o options, imageName, im
 		}
 		if r.GoldRepo {
 			fmt.Fprintf(out, "    Names eligible for GoldRepo matching: %s\n", strings.Join(r.ImageNames, ", "))
+		} else if len(r.ImageNames) > 0 {
+			fmt.Fprintf(out, "    Image name: %q (from this labels.json identity)\n", r.ImageNames[0])
 		}
 		seen := map[string]bool{}
 		values := []finder.Candidate{}
@@ -77,9 +78,6 @@ func printReports(out io.Writer, docs []documentReport, o options, imageName, im
 
 	o.progressStep(6, "Matching product CPEs")
 	section(out, 6, "Match product CPEs")
-	if imageCPE != "" {
-		fmt.Fprintf(out, "  Image CPE: %s (from selected labels.json)\n", imageCPE)
-	}
 	for _, doc := range docs {
 		r := doc.report
 		matched := 0
@@ -98,6 +96,8 @@ func printReports(out io.Writer, docs []documentReport, o options, imageName, im
 		}
 		if r.GoldRepo {
 			fmt.Fprintln(out, "    GoldRepo: advisory CPE is not compared; Claircore matches by RHCC repository key and package name.")
+		} else if imageCPE != "" {
+			fmt.Fprintf(out, "    Image CPE: %s (from this labels.json identity)\n", imageCPE)
 		}
 		seen := map[string]bool{}
 		values := []finder.ProductCheck{}
@@ -134,6 +134,7 @@ func printReports(out io.Writer, docs []documentReport, o options, imageName, im
 
 	o.progressStep(7, "Following CSAF status relationships")
 	section(out, 7, "Follow CSAF status relationships")
+	fmt.Fprintln(out, "  A MATCH here links a VEX component name to an advisory product; Step 8 still checks package kind, package name, and version.")
 	for _, doc := range docs {
 		r := doc.report
 		relevant := 0
@@ -159,6 +160,9 @@ func printReports(out io.Writer, docs []documentReport, o options, imageName, im
 				if st.Title == "Interpret status" {
 					fmt.Fprintf(out, "      Meaning: %s\n", st.Result)
 				}
+			}
+			if s.Relevant && s.Status == "known_affected" && r.SourcePackageName != "" && s.PackageName != r.SourcePackageName {
+				fmt.Fprintf(out, "      Source package check: VEX name %q differs from image source package %q; this linked row cannot match a source-package assertion.\n", s.PackageName, r.SourcePackageName)
 			}
 		}
 	}
@@ -200,6 +204,9 @@ func printReports(out io.Writer, docs []documentReport, o options, imageName, im
 			}
 		}
 		fmt.Fprintf(out, "    Conclusion: %s\n", r.Summary)
+		if names, ok := linkedSourceNameMismatch(r); ok && len(r.Assertions) == 0 {
+			fmt.Fprintf(out, "    Note: Linked known_affected rows name %s, but the image source package is %q. Claircore emits known_affected assertions for source packages, so none match this image.\n", strings.Join(names, "; "), r.SourcePackageName)
+		}
 		for _, warning := range r.Warnings {
 			if !strings.HasPrefix(warning, "Scope:") && !strings.HasPrefix(warning, "Architecture is shown") {
 				fmt.Fprintf(out, "    Note: %s\n", warning)
@@ -209,6 +216,10 @@ func printReports(out io.Writer, docs []documentReport, o options, imageName, im
 
 	o.progressStep(9, "Comparing feed conclusions")
 	summary := printConclusions(out, docs)
+	if imageName == "" && o.summary != nil {
+		imageName, imageCPE = o.summary.DetectedName, o.summary.DetectedCPE
+	}
+	summary.DetectedName, summary.DetectedCPE = imageName, imageCPE
 	if o.summary != nil {
 		*o.summary = summary
 	}
@@ -237,28 +248,56 @@ type feedDecision struct {
 }
 
 type walkSummary struct {
-	Current feedDecision
-	Legacy  feedDecision
+	Current                   feedDecision
+	Legacy                    feedDecision
+	DetectedName, DetectedCPE string
 }
 
 func (s walkSummary) currentDecision() feedDecision {
 	if s.Current.Available {
 		return s.Current
 	}
-	return feedDecision{Label: "Incomplete", Reason: "The new VEX feed was unavailable or matching did not reach a conclusion."}
+	return feedDecision{Label: "Unavailable", Reason: "No new VEX feed document was loaded."}
 }
 
 func (s walkSummary) legacyDecision() feedDecision {
 	if s.Legacy.Available {
 		return s.Legacy
 	}
-	return feedDecision{Label: "Unavailable", Reason: "No old VEX feed conclusion is available."}
+	return feedDecision{Label: "Unavailable", Reason: "No old VEX feed document was loaded."}
+}
+
+func (s *walkSummary) markImageIncomplete(label, reason string) {
+	if s == nil {
+		return
+	}
+	decision := feedDecision{Available: true, Label: label, Reason: reason}
+	s.Current, s.Legacy = decision, decision
 }
 
 func renderText(out io.Writer, summary walkSummary, trace string) error {
 	current, legacy := summary.currentDecision(), summary.legacyDecision()
 	_, err := fmt.Fprintf(out, "Conclusion (New VEX feed): %s\n  %s\nOld VEX feed: %s\n  %s\n\n%s", current.Label, current.Reason, legacy.Label, legacy.Reason, trace)
 	return err
+}
+
+// renderCSV emits one spreadsheet row for the selected image and CVE. The
+// conclusions are VEX matching conclusions, not StackRox OSV scan outcomes.
+func renderCSV(out io.Writer, o options, summary walkSummary) error {
+	w := csv.NewWriter(out)
+	if err := w.Write([]string{"image", "cve", "detected_name", "detected_cpe", "old_vex_conclusion", "new_vex_conclusion"}); err != nil {
+		return err
+	}
+	image := o.image
+	if image == "" {
+		image = o.archive
+	}
+	old, current := summary.legacyDecision(), summary.currentDecision()
+	if err := w.Write([]string{image, strings.ToUpper(strings.TrimSpace(o.cve)), summary.DetectedName, summary.DetectedCPE, old.Label, current.Label}); err != nil {
+		return err
+	}
+	w.Flush()
+	return w.Error()
 }
 
 func conclude(r *finder.Report) feedConclusion {
@@ -339,6 +378,47 @@ func printConclusions(out io.Writer, docs []documentReport) walkSummary {
 			continue
 		}
 		decision := c.decision()
+		if decision.Label == "No matching assertion" {
+			decision = explainNoMatch(c, docs, name)
+		} else if decision.Label == "Affected" || decision.Label == "Not affected" {
+			var identities []string
+			var example string
+			seen := make(map[string]bool)
+			for _, doc := range docs {
+				if doc.name != name {
+					continue
+				}
+				for _, assertion := range doc.report.Assertions {
+					if !assertion.Match || (decision.Label == "Affected") == assertion.Invert {
+						continue
+					}
+					identity := doc.identity
+					if doc.report.GoldRepo {
+						identity += " (GoldRepo; advisory CPE not compared)"
+					}
+					if !seen[identity] {
+						identities = append(identities, identity)
+						seen[identity] = true
+					}
+					if example == "" {
+						example = fmt.Sprintf("package %q", assertion.Name)
+						if assertion.Fixed != "" {
+							example += fmt.Sprintf(", fixed version %q", assertion.Fixed)
+						}
+						if len(assertion.SourceStatusIDs) > 0 {
+							example += fmt.Sprintf(", CSAF status %q", assertion.SourceStatusIDs[0])
+						}
+					}
+				}
+			}
+			if len(identities) > 0 {
+				kind, count := "affected", c.affected
+				if decision.Label == "Not affected" {
+					kind, count = "not affected", c.notAffected
+				}
+				decision.Reason = fmt.Sprintf("%d %s assertions matched via %s. Example: %s. See the linked status and assertion evidence in Steps 7–9.", count, kind, strings.Join(identities, ", "), example)
+			}
+		}
 		if name == "Old VEX feed" {
 			summary.Legacy = decision
 		} else {
@@ -353,4 +433,168 @@ func printConclusions(out io.Writer, docs []documentReport) walkSummary {
 		fmt.Fprintf(out, "    Conclusion: %s\n    Reason: %s\n", decision.Label, decision.Reason)
 	}
 	return summary
+}
+
+// linkedSourceNameMismatch identifies the case where Step 7 finds only
+// known_affected rows through a binary/ancestry name, while Claircore's parser
+// emits those rows as source-package assertions.
+func linkedSourceNameMismatch(r *finder.Report) ([]string, bool) {
+	if r == nil || r.SourcePackageName == "" {
+		return nil, false
+	}
+	seen := make(map[string]bool)
+	for _, status := range r.Statuses {
+		if !status.Relevant {
+			continue
+		}
+		if status.Status != "known_affected" || status.PackageName == r.SourcePackageName {
+			return nil, false
+		}
+		seen[status.PackageName] = true
+	}
+	if len(seen) == 0 {
+		return nil, false
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, true
+}
+
+func explainNoMatch(c feedConclusion, docs []documentReport, feed string) feedDecision {
+	decision := feedDecision{Available: true}
+	const caution = " This does not establish that the image is safe or fixed."
+	goldRepo := false
+	nameSet := make(map[string]bool)
+	for _, doc := range docs {
+		if doc.name != feed {
+			continue
+		}
+		if doc.report.GoldRepo {
+			goldRepo = true
+		}
+		for _, name := range doc.report.ImageNames {
+			if name != "" {
+				nameSet[name] = true
+			}
+		}
+	}
+	switch {
+	case c.components == 0:
+		if goldRepo {
+			decision.Label = "No matching assertion — no eligible package name found"
+			var names []string
+			for name := range nameSet {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			decision.Reason = "No OCI component name in this VEX feed matched any eligible Claircore package name"
+			if len(names) > 0 {
+				decision.Reason += ": " + strings.Join(names, "; ")
+			}
+			decision.Reason += "." + caution
+		} else {
+			decision.Label = "No matching assertion — OCI name not found"
+			decision.Reason = "No OCI component name in this VEX feed matched the selected labels.json image name." + caution
+		}
+	case c.products == 0:
+		if goldRepo {
+			decision.Label = "No matching assertion — advisory product not found"
+			decision.Reason = "The OCI name matched, but no advisory product was eligible for the image identity." + caution
+		} else {
+			decision.Label = "No matching assertion — product CPE not found"
+			decision.Reason = "The OCI name matched, but no advisory product CPE matched the selected image repository." + caution
+		}
+	case c.statuses == 0:
+		if goldRepo {
+			decision.Label = "No matching assertion — name/product not linked"
+		} else {
+			decision.Label = "No matching assertion — name/CPE not linked"
+		}
+		decision.Reason = "The name and product matched separately, but no CSAF status relationship linked them for this image." + caution
+	default:
+		var assertions []finder.Assertion
+		for _, doc := range docs {
+			if doc.name == feed {
+				assertions = append(assertions, doc.report.Assertions...)
+			}
+		}
+		if len(assertions) == 0 {
+			var mismatchedNames []string
+			var sourceNames []string
+			matchedOnlyByOtherKind := true
+			for _, doc := range docs {
+				if doc.name != feed {
+					continue
+				}
+				hasLinkedStatus := false
+				for _, status := range doc.report.Statuses {
+					if status.Relevant {
+						hasLinkedStatus = true
+						break
+					}
+				}
+				if !hasLinkedStatus {
+					continue
+				}
+				names, ok := linkedSourceNameMismatch(doc.report)
+				if !ok {
+					matchedOnlyByOtherKind = false
+					break
+				}
+				mismatchedNames = append(mismatchedNames, names...)
+				sourceNames = append(sourceNames, doc.report.SourcePackageName)
+			}
+			if matchedOnlyByOtherKind && len(mismatchedNames) > 0 {
+				decision.Label = "No matching assertion — source package name mismatch"
+				decision.Reason = fmt.Sprintf("Linked known_affected rows name %s, but the image source package is %s. Claircore emits known_affected assertions for source packages, so none match this image.", strings.Join(mismatchedNames, "; "), strings.Join(sourceNames, "; ")) + caution
+			} else {
+				decision.Label = "No matching assertion — linked status, no assertion"
+				decision.Reason = "A CSAF status linked the name and product, but Claircore emitted no matching assertion from it." + caution
+			}
+			return decision
+		}
+		cpeRejected, rangeRejected, fixedRejected := 0, 0, 0
+		for _, assertion := range assertions {
+			cpeMatched, rangeMatched := false, false
+			matcherRejected := false
+			for _, step := range assertion.Steps {
+				switch step.Title {
+				case "GoldRepo matching", "Standard CPE comparison", "Red Hat prefix fallback":
+					if step.Title == "GoldRepo matching" || strings.HasSuffix(step.Result, ": true") {
+						cpeMatched = true
+					}
+				case "Database version-range filter":
+					rangeMatched = strings.HasSuffix(step.Result, ": true")
+				case "RHCC matcher":
+					matcherRejected = strings.HasSuffix(step.Result, "Match: false")
+				}
+			}
+			switch {
+			case !cpeMatched:
+				cpeRejected++
+			case !rangeMatched:
+				rangeRejected++
+			case matcherRejected && assertion.Fixed != "":
+				fixedRejected++
+			}
+		}
+		switch {
+		case cpeRejected == len(assertions):
+			decision.Label = "No matching assertion — assertion CPE mismatch"
+			decision.Reason = "The linked status was found, but Claircore rejected the parsed assertions on repository CPE." + caution
+		case rangeRejected == len(assertions):
+			decision.Label = "No matching assertion — version outside range"
+			decision.Reason = "The linked status was found, but the image version fell outside the parsed assertion ranges." + caution
+		case fixedRejected == len(assertions):
+			decision.Label = "No matching assertion — fixed-version check"
+			decision.Reason = "The linked fixed assertions did not match the image under Claircore's version comparison." + caution
+		default:
+			decision.Label = "No matching assertion — linked assertions rejected"
+			decision.Reason = "The name, product, and CSAF status linked, but no parsed assertion passed all Claircore checks." + caution
+		}
+	}
+	return decision
 }

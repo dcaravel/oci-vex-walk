@@ -273,12 +273,10 @@ func organizeStep(step *htmlStep) {
 	next:
 	}
 	collapseEvidence := false
-	if step.Number != 8 {
-		for _, feed := range step.Feeds {
-			if len(feed.Items) > 10 {
-				collapseEvidence = true
-				break
-			}
+	for _, feed := range step.Feeds {
+		if len(feed.Items) > 10 {
+			collapseEvidence = true
+			break
 		}
 	}
 	for i := range step.Feeds {
@@ -288,7 +286,9 @@ func organizeStep(step *htmlStep) {
 }
 
 func renderHTML(out io.Writer, o options, trace string) error {
-	return renderHTMLWithSummary(out, o, walkSummary{}, trace)
+	var summary walkSummary
+	summary.markImageIncomplete("Incomplete", "The walkthrough did not reach feed matching.")
+	return renderHTMLWithSummary(out, o, summary, trace)
 }
 
 func verdictClass(label string) string {
@@ -457,8 +457,8 @@ var htmlPage = template.Must(template.New("walkthrough").Parse(`<!doctype html>
       <p class="feed-guide-note">Step 4 shows the document source actually loaded for this run, including any local override.</p>
     </div>
     <div class="decision-grid" aria-label="VEX conclusions">
-      <div class="decision-card {{.LegacyClass}}" data-feed="old"><p class="decision-source">Old VEX feed</p><strong>{{.Legacy.Label}}</strong><p class="decision-reason">{{.Legacy.Reason}}</p>{{if .HasConclusions}}<a href="#step-9">View conclusion details</a>{{end}}</div>
-      <div class="decision-card {{.CurrentClass}}" data-feed="new"><p class="decision-source">New VEX feed · Claircore source</p><strong>{{.Current.Label}}</strong><p class="decision-reason">{{.Current.Reason}}</p>{{if .HasConclusions}}<a href="#step-9">View conclusion details</a>{{end}}</div>
+      <div class="decision-card {{.LegacyClass}}" data-feed="old"><p class="decision-source">Old VEX feed</p><strong>{{.Legacy.Label}}</strong><p class="decision-reason">{{.Legacy.Reason}}</p>{{if .HasConclusions}}<a href="#step-7">Status relationships</a> · <a href="#step-8">Matched assertions</a> · <a href="#step-9">Conclusions</a>{{end}}</div>
+      <div class="decision-card {{.CurrentClass}}" data-feed="new"><p class="decision-source">New VEX feed · Claircore source</p><strong>{{.Current.Label}}</strong><p class="decision-reason">{{.Current.Reason}}</p>{{if .HasConclusions}}<a href="#step-7">Status relationships</a> · <a href="#step-8">Matched assertions</a> · <a href="#step-9">Conclusions</a>{{end}}</div>
     </div>
   </header>
   <div class="shell">

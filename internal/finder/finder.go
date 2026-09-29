@@ -85,6 +85,7 @@ type Assertion struct {
 type Report struct {
 	Identity                string                         `json:"identity,omitempty"`
 	ImageNames              []string                       `json:"image_names,omitempty"`
+	SourcePackageName       string                         `json:"source_package_name,omitempty"`
 	GoldRepo                bool                           `json:"gold_repo,omitempty"`
 	ParserDiagnostics       []json.RawMessage              `json:"parser_diagnostics"`
 	CVE                     string                         `json:"cve"`
@@ -202,6 +203,7 @@ func Analyze(req Request) (*Report, error) {
 		minorStart := parsed.MinorStart()
 		normalized = minorStart.Version(true)
 		nameSet[legacy.Component] = true
+		report.SourcePackageName = legacy.Component
 		for _, name := range legacy.Repositories {
 			if name != "" {
 				nameSet[name] = true
@@ -240,6 +242,7 @@ func Analyze(req Request) (*Report, error) {
 		}
 		normalized = parsedVersion.Version(true)
 		nameSet[l.Name] = true
+		report.SourcePackageName = l.Name
 		report.Identity = "labels.json"
 		report.Steps = append(report.Steps, step("1. Read labels.json", "Source, binary and ancestry packages all use name directly. No name-to-repository mapping.", l), step("2. Derive image version", "Convert creation time to Unix seconds; normalize with rhctag", map[string]any{"version": version, "normalized": normalized, "cpe": imageCPE.String()}))
 	}
@@ -389,7 +392,7 @@ func Analyze(req Request) (*Report, error) {
 				case "known_not_affected":
 					s.Steps = append(s.Steps, step("Interpret status", "OCI not affected: ancestry assertion with Invert=true; discard tag/version/epoch; all-version range", nil))
 				case "known_affected":
-					s.Steps = append(s.Steps, step("Interpret status", "Source-package affected assertion with all-version range", nil))
+					s.Steps = append(s.Steps, step("Interpret status", "Can produce a source-package affected assertion with an all-version range; Step 8 checks package kind and name", nil))
 				case "fixed":
 					s.Steps = append(s.Steps, step("Interpret status", "Use the tag qualifier as the fixed version; apply the normalized range and RHCC comparison", nil))
 				default:

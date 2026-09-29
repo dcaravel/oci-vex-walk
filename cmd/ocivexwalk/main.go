@@ -30,11 +30,13 @@ import (
 
 type options struct {
 	image, archive, cve, oldDocument, newDocument, nameToReposMap, platform, format string
+	inputCSV, imageColumn, cveColumn                                                string
 	verbose                                                                         bool
 	embedVEXDocs                                                                    bool
 	progress                                                                        io.Writer
 	summary                                                                         *walkSummary
 	documents                                                                       *[]capturedDocument
+	documentCache                                                                   map[string][]byte
 }
 
 type capturedDocument struct {
@@ -133,6 +135,17 @@ func readDocument(ctx context.Context, client *http.Client, source string) ([]by
 	return io.ReadAll(reader)
 }
 
+func (o options) loadDocument(ctx context.Context, client *http.Client, source string) ([]byte, error) {
+	if data, ok := o.documentCache[source]; ok {
+		return data, nil
+	}
+	data, err := readDocument(ctx, client, source)
+	if err == nil && o.documentCache != nil {
+		o.documentCache[source] = data
+	}
+	return data, err
+}
+
 func main() {
 	if err := newCommand().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "ocivexwalk:", err)
@@ -153,6 +166,12 @@ func newCommand() *cobra.Command {
 			if o.embedVEXDocs && o.format != "html" {
 				return errors.New("--embed-vex-docs requires --format html")
 			}
+			if o.inputCSV != "" {
+				if o.format != "text" && o.format != "csv" {
+					return errors.New("--input-csv outputs CSV and cannot be combined with --format html")
+				}
+				return runBatchCSV(cmd.Context(), o, cmd.OutOrStdout())
+			}
 			var summary walkSummary
 			o.summary = &summary
 			var documents []capturedDocument
@@ -166,6 +185,12 @@ func newCommand() *cobra.Command {
 					return err
 				}
 				return renderText(cmd.OutOrStdout(), summary, trace.String())
+			case "csv":
+				var trace bytes.Buffer
+				if err := run(cmd.Context(), o, &trace); err != nil {
+					return err
+				}
+				return renderCSV(cmd.OutOrStdout(), o, summary)
 			case "html":
 				var trace bytes.Buffer
 				if err := run(cmd.Context(), o, &trace); err != nil {
@@ -179,7 +204,7 @@ func newCommand() *cobra.Command {
 				o.progressStep(9, "HTML report ready")
 				return nil
 			default:
-				return fmt.Errorf("unknown output format %q; choose text or html", o.format)
+				return fmt.Errorf("unknown output format %q; choose text, csv, or html", o.format)
 			}
 		},
 	}
@@ -191,7 +216,10 @@ func newCommand() *cobra.Command {
 	flags.StringVar(&o.newDocument, "new-document", "", "local new VEX JSON (default: fetch from /vex-feed/)")
 	flags.StringVar(&o.nameToReposMap, "name-to-repos-map", "", "local JSON map for legacy Dockerfile packages (default: fetch Red Hat's map)")
 	flags.StringVar(&o.platform, "platform", defaultPlatform, "platform used when pulling an image, regardless of host")
-	flags.StringVar(&o.format, "format", "text", "output format: text or html")
+	flags.StringVar(&o.format, "format", "text", "output format: text, csv, or html")
+	flags.StringVar(&o.inputCSV, "input-csv", "", "CSV spreadsheet to enrich; writes CSV to stdout")
+	flags.StringVar(&o.imageColumn, "image-column", "image", "input image column: header, Excel letter, or 1-based number")
+	flags.StringVar(&o.cveColumn, "cve-column", "cve", "input CVE column: header, Excel letter, or 1-based number")
 	flags.BoolVar(&o.embedVEXDocs, "embed-vex-docs", false, "embed loaded VEX documents and legacy name map for download in the HTML report")
 	flags.BoolVar(&o.verbose, "verbose", false, "show every rejected component and product")
 	return cmd
@@ -287,6 +315,10 @@ func run(ctx context.Context, o options, out io.Writer) error {
 		valid                    bool
 	}
 	identities := []identity{}
+	type identityIssue struct{ label, detail string }
+	issuesByLayer := make(map[int]identityIssue)
+	var latestLabelsIssue identityIssue
+	foundLabels := false
 	var legacy *finder.LegacyIdentity
 	legacyMappingUnavailable := false
 	legacyLayer := -1
@@ -315,6 +347,7 @@ func run(ctx context.Context, o options, out io.Writer) error {
 		// Claircore tries root/buildinfo before usr/share/buildinfo.
 		sort.Slice(labels, func(i, j int) bool { return labels[i].Path < labels[j].Path })
 		if len(labels) > 0 {
+			foundLabels = true
 			selected := labels[0]
 			for _, f := range labels {
 				if f.Path == selected.Path {
@@ -326,6 +359,8 @@ func run(ctx context.Context, o options, out io.Writer) error {
 			var raw map[string]json.RawMessage
 			if err := json.Unmarshal(selected.Data, &raw); err != nil {
 				fmt.Fprintf(out, "    Invalid labels JSON: %v.\n", err)
+				issue := identityIssue{"Incomplete — invalid labels.json", fmt.Sprintf("%s in layer %d is invalid JSON: %v", selected.Path, layer.Number, err)}
+				issuesByLayer[layer.Number], latestLabelsIssue = issue, issue
 			} else {
 				value := func(k string) string { var s string; _ = json.Unmarshal(raw[k], &s); return s }
 				id := identity{layer: layer.Number, path: selected.Path, data: selected.Data, name: value("name"), arch: value("architecture"), cpe: value("cpe"), created: value("org.opencontainers.image.created")}
@@ -334,8 +369,28 @@ func run(ctx context.Context, o options, out io.Writer) error {
 						*field = unquoted
 					}
 				}
-				_, timestampErr := time.Parse(time.RFC3339, id.created)
-				id.valid = id.name != "" && id.arch != "" && timestampErr == nil
+				createdTime, timestampErr := time.Parse(time.RFC3339, id.created)
+				id.valid = id.name != "" && id.arch != "" && timestampErr == nil && !createdTime.IsZero()
+				var missing []string
+				if id.name == "" {
+					missing = append(missing, "name")
+				}
+				if id.arch == "" {
+					missing = append(missing, "architecture")
+				}
+				if id.created == "" {
+					missing = append(missing, "created")
+				}
+				if id.cpe == "" {
+					missing = append(missing, "CPE")
+				}
+				if len(missing) > 0 {
+					issue := identityIssue{"Incomplete — labels.json missing " + strings.Join(missing, ", "), fmt.Sprintf("%s in layer %d is missing %s; created means org.opencontainers.image.created.", selected.Path, layer.Number, strings.Join(missing, ", "))}
+					issuesByLayer[layer.Number], latestLabelsIssue = issue, issue
+				} else if timestampErr != nil || createdTime.IsZero() {
+					issue := identityIssue{"Incomplete — labels.json invalid created", fmt.Sprintf("%s in layer %d has an invalid org.opencontainers.image.created timestamp: %q.", selected.Path, layer.Number, id.created)}
+					issuesByLayer[layer.Number], latestLabelsIssue = issue, issue
+				}
 				identities = append(identities, id)
 				fmt.Fprintf(out, "    Name:     %s\n    Arch:     %s\n    CPE:      %s\n    Created:  %s\n", id.name, id.arch, id.cpe, id.created)
 				if id.cpe != "" {
@@ -345,7 +400,7 @@ func run(ctx context.Context, o options, out io.Writer) error {
 					fmt.Fprintln(out, "    RHCC repository: absent (no CPE)")
 				}
 				if !id.valid {
-					fmt.Fprintln(out, "    Package: not emitted; required name, architecture, or valid creation time is missing.")
+					fmt.Fprintf(out, "    Package: not emitted; %s\n", issuesByLayer[layer.Number].detail)
 				}
 			}
 		}
@@ -380,11 +435,17 @@ func run(ctx context.Context, o options, out io.Writer) error {
 			fmt.Fprintln(out, "    RHCC GoldRepo: present (legacy Dockerfile path).")
 		}
 	}
-	if len(identities) == 0 {
+	if !foundLabels {
 		fmt.Fprintln(out, "  No labels.json found. Checking whether a legacy Dockerfile identity can match.")
 	}
 	if latestRepo < 0 {
 		fmt.Fprintln(out, "  No RHCC repository was detected. Claircore's RHCC coalescer has no image identity to match.")
+		label, reason := "Incomplete", "No RHCC repository was detected, so this image cannot be checked against either feed."
+		if latestLabelsIssue.label != "" {
+			label, reason = latestLabelsIssue.label, latestLabelsIssue.detail+" No RHCC repository was detected, so neither feed can be checked."
+		}
+		fmt.Fprintf(out, "  Stop reason: %s\n", reason)
+		o.summary.markImageIncomplete(label, reason)
 		o.progressStep(2, "Finished: no RHCC repository was found")
 		return nil
 	}
@@ -403,8 +464,19 @@ func run(ctx context.Context, o options, out io.Writer) error {
 		fmt.Fprintf(out, "  Legacy Dockerfile from layer %d is unmatchable because layer %d has newer RHCC repository content.\n", legacyLayer, latestRepo)
 		legacy = nil
 	}
+	if o.summary != nil {
+		if selected != nil {
+			o.summary.DetectedName, o.summary.DetectedCPE = selected.name, selected.cpe
+		}
+	}
 	if selected == nil && legacy == nil {
 		fmt.Fprintln(out, "  The latest RHCC layer has no usable labels.json or legacy Dockerfile package identity.")
+		label, reason := "Incomplete", "The latest RHCC layer has no usable image identity, so neither feed can be checked."
+		if issue := issuesByLayer[latestRepo]; issue.label != "" {
+			label, reason = issue.label, issue.detail+" No package identity was emitted on the latest RHCC layer; older identities are unmatchable, so neither feed can be checked."
+		}
+		fmt.Fprintf(out, "  Stop reason: %s\n", reason)
+		o.summary.markImageIncomplete(label, reason)
 		o.progressStep(2, "Finished: latest RHCC layer has no usable identity")
 		return nil
 	}
@@ -425,7 +497,7 @@ func run(ctx context.Context, o options, out io.Writer) error {
 		var mappingData []byte
 		err := o.progressTask(3, "Loading legacy container name mapping from "+location, func() error {
 			var readErr error
-			mappingData, readErr = readDocument(ctx, client, location)
+			mappingData, readErr = o.loadDocument(ctx, client, location)
 			return readErr
 		})
 		if err != nil {
@@ -488,7 +560,7 @@ func run(ctx context.Context, o options, out io.Writer) error {
 		var data []byte
 		err := o.progressTask(4, "Loading "+src.name+" from "+location, func() error {
 			var readErr error
-			data, readErr = readDocument(ctx, client, location)
+			data, readErr = o.loadDocument(ctx, client, location)
 			return readErr
 		})
 		if err != nil {
@@ -546,9 +618,25 @@ func run(ctx context.Context, o options, out io.Writer) error {
 		return errors.New("neither VEX document could be analyzed")
 	}
 	imageName, imageCPE := "", ""
+	matchingNames := make(map[string]bool)
 	if selected != nil {
-		imageName, imageCPE = selected.name, selected.cpe
+		matchingNames[selected.name] = true
+		imageCPE = selected.cpe
 	}
+	if legacy != nil {
+		matchingNames[legacy.Component] = true
+		for _, name := range legacy.Repositories {
+			if name != "" {
+				matchingNames[name] = true
+			}
+		}
+	}
+	var names []string
+	for name := range matchingNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	imageName = strings.Join(names, "; ")
 	printReports(out, reports, o, imageName, imageCPE)
 	o.progressStep(9, "Analysis complete")
 	return nil

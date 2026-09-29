@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -237,6 +238,361 @@ func TestOfflineWalkHonorsLatestRHCCLayer(t *testing.T) {
 	}
 }
 
+func TestCSVReportShowsFeedConclusionsForSpreadsheet(t *testing.T) {
+	demo, err := os.ReadFile("../../testdata/demo.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input struct{ Labels, Document json.RawMessage }
+	if err := json.Unmarshal(demo, &input); err != nil {
+		t.Fatal(err)
+	}
+	manifest, _ := json.Marshal([]map[string]any{{"Layers": []string{"layer.tar"}}})
+	archive := tarBytes(t, map[string][]byte{
+		"manifest.json": manifest,
+		"layer.tar":     tarBytes(t, map[string][]byte{"root/buildinfo/labels.json": input.Labels}),
+	})
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "image,part.tar")
+	oldPath := filepath.Join(dir, "old.json")
+	newPath := filepath.Join(dir, "new.json")
+	oldDocument := bytes.ReplaceAll(input.Document, []byte("example/widget"), []byte("example/other"))
+	for path, data := range map[string][]byte{archivePath: archive, oldPath: oldDocument, newPath: input.Document} {
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out, progress bytes.Buffer
+	cmd := newCommand()
+	cmd.SetOut(&out)
+	cmd.SetErr(&progress)
+	cmd.SetArgs([]string{"--archive", archivePath, "--cve", "CVE-2099-0001", "--old-document", oldPath, "--new-document", newPath, "--format", "csv"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	records, err := csv.NewReader(&out).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("CSV has %d rows, want header and one result: %q", len(records), out.String())
+	}
+	wantHeader := []string{"image", "cve", "detected_name", "detected_cpe", "old_vex_conclusion", "new_vex_conclusion"}
+	if !reflect.DeepEqual(records[0], wantHeader) {
+		t.Fatalf("CSV header = %q", records[0])
+	}
+	row := records[1]
+	if row[0] != archivePath || row[1] != "CVE-2099-0001" || row[2] != "example/widget" || row[3] != "cpe:/a:redhat:widget:4.13::el8" || row[4] != "No matching assertion — OCI name not found" || row[5] != "Conflicting evidence" {
+		t.Fatalf("unexpected CSV row: %q", row)
+	}
+	if strings.Contains(out.String(), "Step 1") || strings.Contains(out.String(), "Step 9") {
+		t.Fatalf("CSV contains walkthrough trace: %s", out.String())
+	}
+	var trace, page bytes.Buffer
+	var summary walkSummary
+	if err := run(context.Background(), options{archive: archivePath, cve: "CVE-2099-0001", oldDocument: oldPath, newDocument: newPath, summary: &summary}, &trace); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(trace.String(), "Conclusion: No matching assertion — OCI name not found") {
+		t.Fatalf("text conclusion does not name the failed check: %s", trace.String())
+	}
+	if err := renderHTMLWithSummary(&page, options{archive: archivePath, cve: "CVE-2099-0001"}, summary, trace.String()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(page.String(), "<strong>No matching assertion — OCI name not found</strong>") {
+		t.Fatal("HTML conclusion differs from text and CSV")
+	}
+
+	out.Reset()
+	cmd = newCommand()
+	cmd.SetOut(&out)
+	cmd.SetErr(&progress)
+	cmd.SetArgs([]string{"--archive", archivePath, "--cve", "CVE-2099-0001", "--old-document", filepath.Join(dir, "missing.json"), "--new-document", newPath, "--format", "csv"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	records, err = csv.NewReader(&out).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[1][4] != "Unavailable" || records[1][5] != "Conflicting evidence" {
+		t.Fatalf("unavailable old feed CSV = %q", records)
+	}
+	out.Reset()
+	cmd = newCommand()
+	cmd.SetOut(&out)
+	cmd.SetErr(&progress)
+	cmd.SetArgs([]string{"--archive", archivePath, "--cve", "CVE-2099-0001", "--old-document", newPath, "--new-document", filepath.Join(dir, "missing.json"), "--format", "csv"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	records, err = csv.NewReader(&out).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[1][4] != "Conflicting evidence" || records[1][5] != "Unavailable" {
+		t.Fatalf("unavailable new feed changed old conclusion: %q", records)
+	}
+	trace.Reset()
+	page.Reset()
+	summary = walkSummary{}
+	if err := run(context.Background(), options{archive: archivePath, cve: "CVE-2099-0001", oldDocument: newPath, newDocument: filepath.Join(dir, "missing.json"), summary: &summary}, &trace); err != nil {
+		t.Fatal(err)
+	}
+	var textReport bytes.Buffer
+	if err := renderText(&textReport, summary, trace.String()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(textReport.String(), "Conclusion (New VEX feed): Unavailable") || !strings.Contains(textReport.String(), "Old VEX feed: Conflicting evidence") {
+		t.Fatal("text feed conclusions are not independent")
+	}
+	if err := renderHTMLWithSummary(&page, options{archive: archivePath, cve: "CVE-2099-0001"}, summary, trace.String()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(page.String(), `<div class="decision-card unknown" data-feed="new"><p class="decision-source">New VEX feed · Claircore source</p><strong>Unavailable</strong>`) || !strings.Contains(page.String(), `<strong>Conflicting evidence</strong>`) {
+		t.Fatal("HTML feed conclusions are not independent")
+	}
+
+	invalidPath := filepath.Join(dir, "invalid.json")
+	if err := os.WriteFile(invalidPath, []byte("{invalid"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	cmd = newCommand()
+	cmd.SetOut(&out)
+	cmd.SetErr(&progress)
+	cmd.SetArgs([]string{"--archive", archivePath, "--cve", "CVE-2099-0001", "--old-document", invalidPath, "--new-document", newPath, "--format", "csv"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	records, err = csv.NewReader(&out).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[1][4] != "Incomplete" || records[1][5] != "Conflicting evidence" {
+		t.Fatalf("invalid old feed changed new conclusion: %q", records)
+	}
+
+	cpePath := filepath.Join(dir, "cpe-mismatch.json")
+	cpeDocument := bytes.ReplaceAll(input.Document, []byte("cpe:/a:redhat:widget:4"), []byte("cpe:/a:redhat:other:4"))
+	if err := os.WriteFile(cpePath, cpeDocument, 0600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	cmd = newCommand()
+	cmd.SetOut(&out)
+	cmd.SetErr(&progress)
+	cmd.SetArgs([]string{"--archive", archivePath, "--cve", "CVE-2099-0001", "--old-document", cpePath, "--new-document", newPath, "--format", "csv"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	records, err = csv.NewReader(&out).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := records[1][4]; got != "No matching assertion — product CPE not found" {
+		t.Fatalf("CPE mismatch conclusion = %q", got)
+	}
+}
+
+func TestNoRHCCIdentityMarksBothFeedsIncomplete(t *testing.T) {
+	manifest, _ := json.Marshal([]map[string]any{{"Layers": []string{"layer.tar"}}})
+	archive := tarBytes(t, map[string][]byte{
+		"manifest.json": manifest,
+		"layer.tar":     tarBytes(t, map[string][]byte{"unrelated.txt": []byte("no buildinfo")}),
+	})
+	archivePath := filepath.Join(t.TempDir(), "image.tar")
+	if err := os.WriteFile(archivePath, archive, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var summary walkSummary
+	if err := run(context.Background(), options{archive: archivePath, cve: "CVE-2099-0001", summary: &summary}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if summary.legacyDecision().Label != "Incomplete" || summary.currentDecision().Label != "Incomplete" {
+		t.Fatalf("no image identity decisions = old %q, new %q", summary.legacyDecision().Label, summary.currentDecision().Label)
+	}
+}
+
+func TestStepTwoStopExplainsLabelsFailureInTextHTMLAndCSV(t *testing.T) {
+	demo, err := os.ReadFile("../../testdata/demo.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input struct{ Labels json.RawMessage }
+	if err := json.Unmarshal(demo, &input); err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(input.Labels, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "org.opencontainers.image.created")
+	missingCreated, _ := json.Marshal(fields)
+	for _, tc := range []struct {
+		name, label, detail string
+		layers              [][]byte
+	}{
+		{"missing created after older valid identity", "Incomplete — labels.json missing created", "older identities are unmatchable", [][]byte{input.Labels, missingCreated}},
+		{"invalid labels JSON", "Incomplete — invalid labels.json", "invalid JSON", [][]byte{[]byte("{bad")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var layerPaths []string
+			files := map[string][]byte{}
+			for i, labels := range tc.layers {
+				path := fmt.Sprintf("layer-%d.tar", i)
+				layerPaths = append(layerPaths, path)
+				files[path] = tarBytes(t, map[string][]byte{"root/buildinfo/labels.json": labels})
+			}
+			files["manifest.json"], _ = json.Marshal([]map[string]any{{"Layers": layerPaths}})
+			archivePath := filepath.Join(t.TempDir(), "image.tar")
+			if err := os.WriteFile(archivePath, tarBytes(t, files), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var trace, page, csvOutput bytes.Buffer
+			var summary walkSummary
+			o := options{archive: archivePath, cve: "CVE-2099-0001", summary: &summary}
+			if err := run(context.Background(), o, &trace); err != nil {
+				t.Fatal(err)
+			}
+			if summary.Current.Label != tc.label || summary.Legacy.Label != tc.label {
+				t.Fatalf("conclusions = old %q, new %q", summary.Legacy.Label, summary.Current.Label)
+			}
+			if !strings.Contains(trace.String(), "Stop reason:") || !strings.Contains(trace.String(), tc.detail) || strings.Contains(trace.String(), "Step 3 —") {
+				t.Fatalf("step 2 did not explain stop: %s", trace.String())
+			}
+			if err := renderHTMLWithSummary(&page, o, summary, trace.String()); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(page.String(), "<strong>"+tc.label+"</strong>") != 2 || !strings.Contains(page.String(), tc.detail) {
+				t.Fatalf("HTML verdict omitted stop cause: %s", page.String())
+			}
+			if err := renderCSV(&csvOutput, o, summary); err != nil {
+				t.Fatal(err)
+			}
+			records, err := csv.NewReader(&csvOutput).ReadAll()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 2 || records[1][4] != tc.label || records[1][5] != tc.label {
+				t.Fatalf("CSV conclusions omitted stop cause: %q", records)
+			}
+			if tc.name == "missing created after older valid identity" {
+				inputPath := filepath.Join(t.TempDir(), "input.csv")
+				if err := os.WriteFile(inputPath, []byte("image,cve\ndocker-archive:"+archivePath+",CVE-2099-0001\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				var batchOutput bytes.Buffer
+				cmd := newCommand()
+				cmd.SetOut(&batchOutput)
+				cmd.SetErr(io.Discard)
+				cmd.SetArgs([]string{"--input-csv", inputPath})
+				if err := cmd.Execute(); err != nil {
+					t.Fatal(err)
+				}
+				batchRecords, err := csv.NewReader(&batchOutput).ReadAll()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(batchRecords) != 2 || batchRecords[1][4] != tc.label || batchRecords[1][5] != tc.label {
+					t.Fatalf("batch CSV conclusions omitted stop cause: %q", batchRecords)
+				}
+			}
+		})
+	}
+}
+
+func TestNoMatchConclusionIdentifiesFailedStage(t *testing.T) {
+	const feed = "Old VEX feed"
+	base := feedConclusion{complete: true}
+	for _, tc := range []struct {
+		name   string
+		counts feedConclusion
+		report *finder.Report
+		want   string
+	}{
+		{"name", base, &finder.Report{}, "No matching assertion — OCI name not found"},
+		{"legacy names", base, &finder.Report{GoldRepo: true, ImageNames: []string{"example/source", "example/repo-a", "example/repo-b"}}, "No matching assertion — no eligible package name found"},
+		{"CPE", feedConclusion{complete: true, components: 1}, &finder.Report{}, "No matching assertion — product CPE not found"},
+		{"GoldRepo product", feedConclusion{complete: true, components: 1}, &finder.Report{GoldRepo: true}, "No matching assertion — advisory product not found"},
+		{"relationship", feedConclusion{complete: true, components: 1, products: 1}, &finder.Report{}, "No matching assertion — name/CPE not linked"},
+		{"GoldRepo relationship", feedConclusion{complete: true, components: 1, products: 1}, &finder.Report{GoldRepo: true}, "No matching assertion — name/product not linked"},
+		{"linked status", feedConclusion{complete: true, components: 1, products: 1, statuses: 1}, &finder.Report{}, "No matching assertion — linked status, no assertion"},
+		{"assertion CPE", feedConclusion{complete: true, components: 1, products: 1, statuses: 1}, &finder.Report{Assertions: []finder.Assertion{{Steps: []finder.Step{{Title: "Standard CPE comparison", Result: "Advisory is a superset of, or equal to, image: false"}, {Title: "Red Hat prefix fallback", Result: "Image CPE starts with trimmed advisory CPE: false"}, {Title: "Database version-range filter", Result: "Image normalized version in [lower, upper): true"}}}}}, "No matching assertion — assertion CPE mismatch"},
+		{"version range", feedConclusion{complete: true, components: 1, products: 1, statuses: 1}, &finder.Report{Assertions: []finder.Assertion{{Steps: []finder.Step{{Title: "Standard CPE comparison", Result: "Advisory is a superset of, or equal to, image: true"}, {Title: "Database version-range filter", Result: "Image normalized version in [lower, upper): false"}}}}}, "No matching assertion — version outside range"},
+		{"fixed version", feedConclusion{complete: true, components: 1, products: 1, statuses: 1}, &finder.Report{Assertions: []finder.Assertion{{Fixed: "1.2.3", Steps: []finder.Step{{Title: "Standard CPE comparison", Result: "Advisory is a superset of, or equal to, image: true"}, {Title: "Database version-range filter", Result: "Image normalized version in [lower, upper): true"}, {Title: "RHCC matcher", Result: "Compare image version with fixed version using RPM EVR ordering. Match: false"}}}}}, "No matching assertion — fixed-version check"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := explainNoMatch(tc.counts, []documentReport{{name: feed, report: tc.report}}, feed)
+			if got.Label != tc.want || !strings.Contains(got.Reason, "does not establish") {
+				t.Fatalf("decision = %+v, want %q with scope caveat", got, tc.want)
+			}
+			if tc.name == "legacy names" && !strings.Contains(got.Reason, "example/repo-a; example/repo-b; example/source") {
+				t.Fatalf("legacy no-match reason omitted checked package names: %q", got.Reason)
+			}
+		})
+	}
+}
+
+func TestLinkedKnownAffectedBinaryNameDoesNotMatchLegacySourcePackage(t *testing.T) {
+	demo, err := os.ReadFile("../../testdata/demo.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input struct{ Document json.RawMessage }
+	if err := json.Unmarshal(demo, &input); err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(input.Document, &document); err != nil {
+		t.Fatal(err)
+	}
+	var vulnerabilities []map[string]json.RawMessage
+	if err := json.Unmarshal(document["vulnerabilities"], &vulnerabilities); err != nil {
+		t.Fatal(err)
+	}
+	var statuses map[string]json.RawMessage
+	if err := json.Unmarshal(vulnerabilities[0]["product_status"], &statuses); err != nil {
+		t.Fatal(err)
+	}
+	statuses["known_affected"] = statuses["fixed"]
+	delete(statuses, "fixed")
+	delete(statuses, "known_not_affected")
+	vulnerabilities[0]["product_status"], _ = json.Marshal(statuses)
+	document["vulnerabilities"], _ = json.Marshal(vulnerabilities)
+	data, _ := json.Marshal(document)
+	legacy := &finder.LegacyIdentity{Path: "root/buildinfo/Dockerfile-example", Name: "example/legacy", Component: "example/source", Architecture: "x86_64", Version: "v4.13.0-1", Repositories: []string{"example/widget"}}
+	report, err := finder.Analyze(finder.Request{CVE: "CVE-2099-0001", Document: string(data), Legacy: legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Statuses) == 0 || !report.Statuses[0].Relevant || len(report.Assertions) != 0 {
+		t.Fatalf("expected linked status but no source-package assertion: %+v", report)
+	}
+	var trace, page, csvOutput bytes.Buffer
+	var summary walkSummary
+	o := options{cve: "CVE-2099-0001", summary: &summary}
+	printReports(&trace, []documentReport{{name: "New VEX feed", identity: "legacy Dockerfile", report: report}}, o, "example/source; example/widget", "")
+	if summary.Current.Label != "No matching assertion — source package name mismatch" ||
+		!strings.Contains(summary.Current.Reason, "example/widget") || !strings.Contains(summary.Current.Reason, "example/source") ||
+		!strings.Contains(trace.String(), "Source package check:") || !strings.Contains(trace.String(), "Step 8 —") {
+		t.Fatalf("trace did not explain package kind mismatch: %+v\n%s", summary.Current, trace.String())
+	}
+	if err := renderHTMLWithSummary(&page, o, summary, trace.String()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(page.String(), "Source package check") || !strings.Contains(page.String(), "source package name mismatch") {
+		t.Fatal("HTML report omitted package kind mismatch")
+	}
+	if err := renderCSV(&csvOutput, o, summary); err != nil {
+		t.Fatal(err)
+	}
+	records, err := csv.NewReader(&csvOutput).ReadAll()
+	if err != nil || len(records) != 2 || records[1][5] != summary.Current.Label {
+		t.Fatalf("CSV omitted package kind mismatch: %q, %v", records, err)
+	}
+}
+
 func TestLegacyDockerfileWalkUsesNameMapping(t *testing.T) {
 	demo, err := os.ReadFile("../../testdata/demo.json")
 	if err != nil {
@@ -270,8 +626,50 @@ func TestLegacyDockerfileWalkUsesNameMapping(t *testing.T) {
 	if err := run(context.Background(), options{archive: archivePath, cve: "CVE-2099-0001", oldDocument: docPath, newDocument: docPath, nameToReposMap: mapPath, summary: &summary, documents: &captured}, &trace); err != nil {
 		t.Fatal(err)
 	}
-	if len(captured) != 3 || captured[0].Filename != "container-name-repos-map.json" || summary.Current.Label != "Conflicting evidence" {
+	if len(captured) != 3 || captured[0].Filename != "container-name-repos-map.json" || summary.Current.Label != "Conflicting evidence" || summary.DetectedName != "example-source-container; example/widget" {
 		t.Fatalf("legacy source capture or combined conclusion missing: %d captures, current %q", len(captured), summary.Current.Label)
+	}
+	var csvOutput bytes.Buffer
+	if err := renderCSV(&csvOutput, options{archive: archivePath, cve: "CVE-2099-0001"}, summary); err != nil {
+		t.Fatal(err)
+	}
+	records, err := csv.NewReader(&csvOutput).ReadAll()
+	if err != nil || len(records) != 2 || records[1][2] != "example-source-container; example/widget" || records[1][3] != "" {
+		t.Fatalf("legacy CSV should contain resolved package names and no CPE: %q, %v", records, err)
+	}
+	inputPath := filepath.Join(dir, "input.csv")
+	if err := os.WriteFile(inputPath, []byte("image,cve\ndocker-archive:"+archivePath+",CVE-2099-0001\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	csvOutput.Reset()
+	cmd := newCommand()
+	cmd.SetOut(&csvOutput)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--input-csv", inputPath, "--old-document", docPath, "--new-document", docPath, "--name-to-repos-map", mapPath})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	records, err = csv.NewReader(&csvOutput).ReadAll()
+	if err != nil || len(records) != 2 || records[1][2] != "example-source-container; example/widget" || records[1][3] != "" {
+		t.Fatalf("batch CSV should contain resolved package names and no CPE: %q, %v", records, err)
+	}
+	unmatchedPath := filepath.Join(dir, "unmatched.json")
+	unmatched := bytes.ReplaceAll(input.Document, []byte("example/widget"), []byte("example/unmatched"))
+	unmatched = bytes.ReplaceAll(unmatched, []byte("example-source-container"), []byte("example/unmatched-source"))
+	if err := os.WriteFile(unmatchedPath, unmatched, 0600); err != nil {
+		t.Fatal(err)
+	}
+	csvOutput.Reset()
+	cmd = newCommand()
+	cmd.SetOut(&csvOutput)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--input-csv", inputPath, "--old-document", unmatchedPath, "--new-document", docPath, "--name-to-repos-map", mapPath})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	records, err = csv.NewReader(&csvOutput).ReadAll()
+	if err != nil || len(records) != 2 || records[1][4] != "No matching assertion — no eligible package name found" || records[1][5] != "Conflicting evidence" {
+		t.Fatalf("batch CSV should distinguish legacy name failure by feed: %q, %v", records, err)
 	}
 	for _, want := range []string{"No labels.json found", "Legacy Dockerfile identity:", "Repository name: example/widget", "Names eligible for GoldRepo matching: example-source-container, example/widget", "GoldRepo: advisory CPE is not compared", "Image repository: GoldRepo", "Matched assertions: 1 affected, 1 not affected", "Conclusion: Conflicting evidence"} {
 		if !strings.Contains(trace.String(), want) {
@@ -308,7 +706,7 @@ func TestLegacyDockerfileWalkUsesNameMapping(t *testing.T) {
 	if err := run(context.Background(), options{archive: archivePath, cve: "CVE-2099-0001", oldDocument: docPath, newDocument: docPath, nameToReposMap: mapPath, summary: &summary}, &trace); err != nil {
 		t.Fatal(err)
 	}
-	if summary.Current.Label != "Conflicting evidence" ||
+	if summary.Current.Label != "Conflicting evidence" || summary.DetectedName != "example-source-container; example/widget" ||
 		!strings.Contains(trace.String(), "Identity: labels.json: 1 affected, 1 not affected") ||
 		!strings.Contains(trace.String(), "Identity: legacy Dockerfile: 1 affected, 1 not affected") ||
 		!strings.Contains(trace.String(), "Matched assertions: 2 affected, 2 not affected") {
@@ -318,12 +716,102 @@ func TestLegacyDockerfileWalkUsesNameMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	trace.Reset()
-	if err := run(context.Background(), options{archive: archivePath, cve: "CVE-2099-0001", oldDocument: docPath, newDocument: docPath, nameToReposMap: mapPath}, &trace); err != nil {
+	summary = walkSummary{}
+	if err := run(context.Background(), options{archive: archivePath, cve: "CVE-2099-0001", oldDocument: docPath, newDocument: docPath, nameToReposMap: mapPath, summary: &summary}, &trace); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(trace.String(), "Map entry: absent; Claircore uses the name label") ||
-		!strings.Contains(trace.String(), "Identity: legacy Dockerfile: 0 affected, 0 not affected") {
+		!strings.Contains(trace.String(), "Identity: legacy Dockerfile: 0 affected, 0 not affected") ||
+		summary.DetectedName != "example-source-container; example/legacy; example/widget" {
 		t.Fatal("missing map entry did not fall back to the Dockerfile name label")
+	}
+}
+
+func TestAffectedLegacyIdentityIsVisibleBeforeAndAfterDetailedSteps(t *testing.T) {
+	demo, err := os.ReadFile("../../testdata/demo.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input struct{ Labels, Document json.RawMessage }
+	if err := json.Unmarshal(demo, &input); err != nil {
+		t.Fatal(err)
+	}
+	var labels map[string]any
+	if err := json.Unmarshal(input.Labels, &labels); err != nil {
+		t.Fatal(err)
+	}
+	labels["name"] = "example/unrelated"
+	unrelatedLabels, _ := json.Marshal(labels)
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(input.Document, &document); err != nil {
+		t.Fatal(err)
+	}
+	var vulnerabilities []map[string]json.RawMessage
+	if err := json.Unmarshal(document["vulnerabilities"], &vulnerabilities); err != nil {
+		t.Fatal(err)
+	}
+	var statuses map[string]json.RawMessage
+	if err := json.Unmarshal(vulnerabilities[0]["product_status"], &statuses); err != nil {
+		t.Fatal(err)
+	}
+	delete(statuses, "known_not_affected")
+	vulnerabilities[0]["product_status"], _ = json.Marshal(statuses)
+	document["vulnerabilities"], _ = json.Marshal(vulnerabilities)
+	newDocument, _ := json.Marshal(document)
+	manifest, _ := json.Marshal([]map[string]any{{"Layers": []string{"layer.tar"}}})
+	archive := tarBytes(t, map[string][]byte{
+		"manifest.json": manifest,
+		"layer.tar": tarBytes(t, map[string][]byte{
+			"root/buildinfo/labels.json":                         unrelatedLabels,
+			"root/buildinfo/Dockerfile-example-legacy-v4.13.0-1": []byte("FROM scratch\nLABEL name=\"example/legacy\"\nLABEL com.redhat.component=\"example-source-container\"\nLABEL architecture=\"x86_64\"\n"),
+		}),
+	})
+	dir := t.TempDir()
+	archivePath, docPath, mapPath := filepath.Join(dir, "image.tar"), filepath.Join(dir, "vex.json"), filepath.Join(dir, "map.json")
+	for path, data := range map[string][]byte{
+		archivePath: archive,
+		docPath:     newDocument,
+		mapPath:     []byte(`{"data":{"example/legacy":["example/widget"]}}`),
+	} {
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var trace, page bytes.Buffer
+	var summary walkSummary
+	o := options{archive: archivePath, cve: "CVE-2099-0001", oldDocument: docPath, newDocument: docPath, nameToReposMap: mapPath, summary: &summary}
+	if err := run(context.Background(), o, &trace); err != nil {
+		t.Fatal(err)
+	}
+	if summary.Current.Label != "Affected" || !strings.Contains(summary.Current.Reason, "legacy Dockerfile (GoldRepo; advisory CPE not compared)") || !strings.Contains(summary.Current.Reason, "fixed version") || !strings.Contains(summary.Current.Reason, "CSAF status") {
+		t.Fatalf("new feed verdict lacks matching identity: %+v\n%s", summary.Current, trace.String())
+	}
+	if summary.DetectedName != "example-source-container; example/unrelated; example/widget" {
+		t.Fatalf("detected names should include labels and resolved legacy package names, got %q", summary.DetectedName)
+	}
+	var csvOutput bytes.Buffer
+	if err := renderCSV(&csvOutput, o, summary); err != nil {
+		t.Fatal(err)
+	}
+	records, err := csv.NewReader(&csvOutput).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[1][2] != summary.DetectedName {
+		t.Fatalf("CSV lost matching package names: %q", records)
+	}
+	for _, want := range []string{"Step 7 —", "Step 8 —", "Step 9 —", "Image name: \"example/unrelated\" (from this labels.json identity)", "Names eligible for GoldRepo matching: example-source-container, example/widget", "GoldRepo: advisory CPE is not compared", "Identity: labels.json: 0 affected", "Identity: legacy Dockerfile: 1 affected"} {
+		if !strings.Contains(trace.String(), want) {
+			t.Errorf("trace omitted %q", want)
+		}
+	}
+	if err := renderHTMLWithSummary(&page, o, summary, trace.String()); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`id="step-7"`, `id="step-8"`, `id="step-9"`, `href="#step-8">Matched assertions</a>`, `legacy Dockerfile (GoldRepo; advisory CPE not compared)`, `<p class="feed-identity">Identity: <code class="entry-code">legacy Dockerfile</code></p>`} {
+		if !strings.Contains(page.String(), want) {
+			t.Errorf("HTML omitted %q", want)
+		}
 	}
 }
 
@@ -424,8 +912,8 @@ func TestHTMLFormatEscapesDocumentTextAndHandlesPartialTrace(t *testing.T) {
 	if !strings.Contains(out.String(), `id="step-1"`) {
 		t.Fatal("partial walkthrough was not rendered")
 	}
-	if !strings.Contains(out.String(), `<strong>Incomplete</strong>`) {
-		t.Fatal("partial walkthrough should have an incomplete top verdict")
+	if strings.Count(out.String(), `<strong>Incomplete</strong>`) != 2 {
+		t.Fatal("partial walkthrough should mark both feeds incomplete")
 	}
 }
 
@@ -628,6 +1116,14 @@ func TestHTMLShowsMatchedAssertionsAndCollapsesNonMatches(t *testing.T) {
 		!strings.Contains(out.String(), `<details class="value-list evidence-group" open><summary>Evidence records (1)</summary>`) {
 		t.Fatal("non-matching assertions are not collapsed by default")
 	}
+	large := htmlStep{Number: 8, Lines: []htmlLine{formatLine("  New VEX feed: 11 of 11 assertions match this image")}}
+	for i := 0; i < 11; i++ {
+		large.Lines = append(large.Lines, formatLine(fmt.Sprintf("    MATCH: assertion %d", i)))
+	}
+	organizeStep(&large)
+	if len(large.Feeds) != 1 || !large.Feeds[0].CollapseItems {
+		t.Fatal("large matched assertion lists should start collapsed")
+	}
 }
 
 func TestHTMLGroupsEvidenceByFeedAndKeepsLayerDecisionAfterLayers(t *testing.T) {
@@ -663,6 +1159,8 @@ func TestHTMLGroupsEvidenceByFeedAndKeepsLayerDecisionAfterLayers(t *testing.T) 
 
 func TestComparisonValuesIncludeRejectedDistinctCandidates(t *testing.T) {
 	report := &finder.Report{
+		Identity:   "labels.json",
+		ImageNames: []string{"example/widget"},
 		Candidates: []finder.Candidate{
 			{Derived: "example/widget", Match: true},
 			{Derived: "example/other"},
